@@ -128,7 +128,7 @@ find_latest_image() {
 }
 
 # Pull and run the latest image
-IMAGE='rocm/sgl-dev:v0.5.4.post1-rocm630-mi30x-20251028'
+IMAGE='rocm/sgl-dev:v0.5.4.post1-rocm630-mi30x-20251027'
 echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
 
