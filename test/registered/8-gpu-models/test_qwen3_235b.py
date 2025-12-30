@@ -31,6 +31,8 @@ class TestQwen3235BUnified(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
+            "--attention-backend=triton",
+            "--moe-runner-backend=flashinfer_trtllm",
         ]
 
         variants = [
@@ -59,6 +61,8 @@ class TestQwen3235BUnified(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
+            "--attention-backend=triton",
+            "--moe-runner-backend=flashinfer_trtllm",
         ]
 
         variants = [
