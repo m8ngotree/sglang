@@ -39,7 +39,6 @@ class TestQwen3235BFP8Unified(unittest.TestCase):
             "--tp=8",
             "--ep=2",
             "--trust-remote-code",
-            "--chat-template=qwen",
             "--reasoning-parser=qwen3",
         ]
 
