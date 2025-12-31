@@ -32,9 +32,12 @@ class TestQwen3235BUnified(unittest.TestCase):
 
     def test_qwen3_235b_aime25(self):
         """Run performance and AIME25 accuracy for Qwen3-235B-FP8."""
-        # Use flashinfer_trtllm on B200, triton on H200
+        # Use flashinfer_trtllm on B200, flashinfer_cutlass on H200
         # (flashinfer_trtllm has SM 10.0 compilation issue on H200)
-        moe_backend = "flashinfer_trtllm" if is_blackwell_system() else "triton"
+        # flashinfer_cutlass is optimized for FP8 MoE on H200
+        moe_backend = (
+            "flashinfer_trtllm" if is_blackwell_system() else "flashinfer_cutlass"
+        )
 
         base_args = [
             "--tp=8",
@@ -67,8 +70,11 @@ class TestQwen3235BUnified(unittest.TestCase):
 
     def test_qwen3_235b_gpqa(self):
         """Run GPQA accuracy for Qwen3-235B-FP8 (performance already tested in AIME25)."""
-        # Use flashinfer_trtllm on B200, triton on H200
-        moe_backend = "flashinfer_trtllm" if is_blackwell_system() else "triton"
+        # Use flashinfer_trtllm on B200, flashinfer_cutlass on H200
+        # flashinfer_cutlass is optimized for FP8 MoE on H200
+        moe_backend = (
+            "flashinfer_trtllm" if is_blackwell_system() else "flashinfer_cutlass"
+        )
 
         base_args = [
             "--tp=8",
