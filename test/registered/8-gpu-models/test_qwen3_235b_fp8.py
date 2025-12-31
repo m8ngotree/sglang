@@ -34,12 +34,10 @@ class TestQwen3235BFP8Unified(unittest.TestCase):
         """Run performance and AIME25 accuracy for Qwen3-235B-FP8."""
         # Use official cookbook configuration: TP=8, EP=2
         # Let backends auto-select (no explicit attention/moe backend)
-        # Add chat template and reasoning support for AIME25
         base_args = [
             "--tp=8",
             "--ep=2",
             "--trust-remote-code",
-            "--reasoning-parser=qwen3",
         ]
 
         variants = [
