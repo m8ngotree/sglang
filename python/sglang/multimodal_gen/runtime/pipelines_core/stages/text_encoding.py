@@ -79,6 +79,8 @@ class TextEncodingStage(PipelineStage):
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None
+
+        self.load_model()
         prompt_text: str | list[str] = batch.prompt
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
@@ -119,6 +121,8 @@ class TextEncodingStage(PipelineStage):
             if batch.negative_attention_mask is not None:
                 for nm in neg_masks_list:
                     batch.negative_attention_mask.append(nm)
+
+        self.offload_model()
 
         return batch
 

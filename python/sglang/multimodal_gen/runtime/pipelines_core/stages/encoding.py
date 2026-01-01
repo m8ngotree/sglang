@@ -77,6 +77,7 @@ class EncodingStage(PipelineStage):
         """
         assert batch.latents is not None and isinstance(batch.latents, torch.Tensor)
 
+        self.load_model()
         self.vae = self.vae.to(get_local_torch_device())
 
         # Setup VAE precision
@@ -108,4 +109,5 @@ class EncodingStage(PipelineStage):
         # Update batch with encoded latents
         batch.latents = latents
 
+        self.offload_model()
         return batch
