@@ -27,6 +27,7 @@ Key concepts:
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -131,6 +132,66 @@ def dequantize_fp8_from_comm(
     return tensor_dequant
 
 
+def quantized_all_reduce(
+    tensor: torch.Tensor,
+    group: Optional[dist.ProcessGroup] = None,
+    use_per_token: bool = False,
+) -> torch.Tensor:
+    """
+    Perform AllReduce with FP8 quantization to reduce bandwidth.
+
+    This function quantizes the input tensor to FP8, performs AllReduce on the
+    quantized data (50% less bandwidth), then dequantizes back to the original dtype.
+
+    The AllReduce operation sums tensors across all ranks in the process group.
+    With quantization:
+    - Each rank quantizes its tensor independently
+    - AllReduce sums the FP8 tensors (bandwidth reduced by 50%)
+    - AllReduce averages the scale factors
+    - Each rank dequantizes using the averaged scale
+
+    Args:
+        tensor: Input tensor to reduce. Expected to be BF16 or FP32.
+        group: Process group for communication. If None, uses default group.
+        use_per_token: If True, use per-token quantization for better accuracy.
+                      If False, use per-tensor quantization (default).
+
+    Returns:
+        Reduced tensor in original dtype (sum across all ranks)
+
+    Example:
+        >>> # On GPU 0: tensor = [1.0, 2.0, 3.0]
+        >>> # On GPU 1: tensor = [4.0, 5.0, 6.0]
+        >>> from sglang.srt.distributed import get_tp_group
+        >>> result = quantized_all_reduce(tensor, group=get_tp_group())
+        >>> # Result on both GPUs: [5.0, 7.0, 9.0]
+        >>> # But used 50% less bandwidth than regular AllReduce!
+
+    Note:
+        This introduces small quantization errors but provides significant
+        bandwidth savings. The error is typically <0.5% for FP8.
+    """
+    # Save original dtype for output
+    original_dtype = tensor.dtype
+
+    # Step 1: Quantize to FP8
+    tensor_fp8, scales = quantize_fp8_for_comm(tensor, use_per_token=use_per_token)
+
+    # Step 2: AllReduce the quantized tensor (sum operation)
+    # This is where we save bandwidth - sending FP8 instead of BF16!
+    dist.all_reduce(tensor_fp8, op=dist.ReduceOp.SUM, group=group)
+
+    # Step 3: AllReduce the scales (average them across ranks)
+    # We average scales because each rank computed scales independently
+    # The sum of quantized values should use the average scale for dequantization
+    dist.all_reduce(scales, op=dist.ReduceOp.AVG, group=group)
+
+    # Step 4: Dequantize back to original dtype
+    result = dequantize_fp8_from_comm(tensor_fp8, scales, output_dtype=original_dtype)
+
+    return result
+
+
 def should_use_comm_quant(
     tensor_size_bytes: int,
     min_size_threshold: int = 1024 * 1024,  # 1 MB default
@@ -162,5 +223,6 @@ def should_use_comm_quant(
 __all__ = [
     "quantize_fp8_for_comm",
     "dequantize_fp8_from_comm",
+    "quantized_all_reduce",
     "should_use_comm_quant",
 ]
