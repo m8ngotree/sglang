@@ -93,7 +93,8 @@ def dequantize_fp8_from_comm(
     Dequantize an FP8 tensor back to higher precision after communication.
 
     This function converts an FP8 tensor back to BF16/FP32 using the scale factors
-    computed during quantization.
+    computed during quantization. Uses PyTorch broadcasting to handle both per-tensor
+    and per-token scaling uniformly.
 
     Args:
         tensor_fp8: Quantized FP8 tensor
@@ -114,24 +115,18 @@ def dequantize_fp8_from_comm(
     # Convert FP8 to the target dtype
     tensor_dequant = tensor_fp8.to(output_dtype)
 
-    # Apply scaling
-    if scales.numel() == 1:
-        # Per-tensor: single scale for entire tensor
-        tensor_dequant = tensor_dequant * scales.item()
-    else:
-        # Per-token: scale each row/token
-        # Reshape tensor for broadcasting if needed
-        original_shape = tensor_dequant.shape
-        if tensor_dequant.ndim != 2:
-            tensor_dequant = tensor_dequant.reshape(-1, tensor_dequant.shape[-1])
+    # Reshape to 2D for scaling (if needed)
+    original_shape = tensor_dequant.shape
+    if tensor_dequant.ndim != 2:
+        tensor_dequant = tensor_dequant.reshape(-1, tensor_dequant.shape[-1])
 
-        # scales shape: [M, 1], tensor shape: [M, K]
-        # Broadcasting will scale each row
-        tensor_dequant = tensor_dequant * scales
+    # Apply scaling via broadcasting
+    # Works for both per-tensor [1] and per-token [M, 1] scales
+    tensor_dequant = tensor_dequant * scales
 
-        # Reshape back
-        if len(original_shape) != 2:
-            tensor_dequant = tensor_dequant.reshape(*original_shape)
+    # Reshape back to original shape
+    if len(original_shape) != 2:
+        tensor_dequant = tensor_dequant.reshape(*original_shape)
 
     return tensor_dequant
 
