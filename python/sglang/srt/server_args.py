@@ -454,6 +454,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_comm_quant: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
