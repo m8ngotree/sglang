@@ -452,14 +452,11 @@ class ColumnParallelLinear(LinearBase):
                     should_quantize_comm,
                 )
 
-                if should_quantize_comm(output_parallel):
-                    output = quantized_all_gather(
-                        output_parallel,
-                        world_size=self.tp_size,
-                        group=get_tp_group().device_group,
-                    )
-                else:
-                    output = tensor_model_parallel_all_gather(output_parallel)
+                output = quantized_all_gather(
+                    output_parallel,
+                    world_size=self.tp_size,
+                    group=get_tp_group().device_group,
+                )
             else:
                 output = tensor_model_parallel_all_gather(output_parallel)
         else:
