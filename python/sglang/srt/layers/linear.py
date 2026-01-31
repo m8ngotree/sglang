@@ -446,7 +446,22 @@ class ColumnParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            if get_global_server_args().enable_comm_quant and self.tp_size > 1:
+                from sglang.srt.layers.comm_quant_utils import (
+                    quantized_all_gather,
+                    should_quantize_comm,
+                )
+
+                if should_quantize_comm(output_parallel):
+                    output = quantized_all_gather(
+                        output_parallel,
+                        world_size=self.tp_size,
+                        group=get_tp_group().device_group,
+                    )
+                else:
+                    output = tensor_model_parallel_all_gather(output_parallel)
+            else:
+                output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -1418,20 +1433,9 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            if get_global_server_args().enable_comm_quant:
-                from sglang.srt.layers.comm_quant_utils import (
-                    quantized_all_reduce,
-                    should_use_comm_quant,
-                )
-
-                if should_use_comm_quant(output_parallel):
-                    output = quantized_all_reduce(
-                        output_parallel, group=get_tp_group()
-                    )
-                else:
-                    output = tensor_model_parallel_all_reduce(output_parallel)
-            else:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+            # Note: Quantized AllReduce is NOT beneficial - it requires O(world_size)
+            # more bandwidth than ring-reduce. Only AllGather benefits from FP8 quantization.
+            output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
