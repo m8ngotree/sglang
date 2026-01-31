@@ -447,10 +447,7 @@ class ColumnParallelLinear(LinearBase):
         if self.gather_output:
             # All-gather across the partitions.
             if get_global_server_args().enable_comm_quant and self.tp_size > 1:
-                from sglang.srt.layers.comm_quant_utils import (
-                    quantized_all_gather,
-                    should_quantize_comm,
-                )
+                from sglang.srt.layers.comm_quant_utils import quantized_all_gather
 
                 output = quantized_all_gather(
                     output_parallel,
