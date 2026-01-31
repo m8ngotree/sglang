@@ -14,122 +14,139 @@
 """
 Communication Quantization Utilities
 
-This module provides utilities for quantizing tensors before GPU-to-GPU communication
-to reduce bandwidth usage. It supports FP8 quantization for operations like AllReduce,
-AllGather, and other collective communications.
+Utilities for quantizing tensors to FP8 before GPU-to-GPU communication
+to reduce bandwidth by 50%. Supports AllGather, AllReduce, and ReduceScatter.
 
-Key concepts:
-- Quantize tensors from BF16/FP32 to FP8 before communication (50% bandwidth reduction)
-- Dequantize after communication to restore original precision
-- Use per-tensor or per-token quantization strategies
+Key points:
+- FP8 is a storage/transfer format, not a compute format
+- AllGather is ideal (no arithmetic on FP8)
+- AllReduce uses AllGather + local sum to avoid FP8 overflow
 """
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    scaled_fp8_quant,
-)
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+
+class QuantizedTensor(NamedTuple):
+    """Container for quantized tensor and its scale factors."""
+
+    data: torch.Tensor  # FP8 quantized tensor
+    scales: torch.Tensor  # Scale factors for dequantization
 
 
 def quantize_fp8_for_comm(
     tensor: torch.Tensor,
     use_per_token: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> QuantizedTensor:
     """
     Quantize a tensor to FP8 format for communication.
 
-    This function converts a BF16/FP32 tensor to FP8, reducing its size by 50%.
-    It returns both the quantized tensor and scale factors needed for dequantization.
-
     Args:
-        tensor: Input tensor to quantize. Expected shape: [batch * seq_len, hidden_dim]
-                or [M, K] for general matrix dimensions.
-        use_per_token: If True, use per-token (per-row) quantization for better accuracy.
-                      If False, use per-tensor (single scale) quantization for simplicity.
+        tensor: Input tensor (BF16/FP32, CUDA). Shape: [M, K] or higher dims.
+        use_per_token: If True, use per-row quantization for better accuracy.
 
     Returns:
-        Tuple of (quantized_tensor, scales):
-            - quantized_tensor: FP8 tensor (half the size of input)
-            - scales: Scale factors for dequantization
-                     Shape: [1] for per-tensor, [M, 1] for per-token
-
-    Example:
-        >>> tensor = torch.randn(1024, 4096, dtype=torch.bfloat16, device='cuda')
-        >>> tensor_fp8, scales = quantize_fp8_for_comm(tensor, use_per_token=False)
-        >>> print(f"Original: {tensor.nbytes / 1e6:.2f} MB")
-        >>> print(f"Quantized: {tensor_fp8.nbytes / 1e6:.2f} MB")
-        Original: 8.39 MB
-        Quantized: 4.19 MB
+        QuantizedTensor with data (FP8) and scales ([1] or [M, 1]).
     """
-    # Ensure tensor is 2D for quantization
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+
+    # Reshape to 2D for quantization kernel
     original_shape = tensor.shape
     if tensor.ndim != 2:
-        # Reshape to 2D: [total_tokens, hidden_dim]
         tensor = tensor.reshape(-1, tensor.shape[-1])
 
-    # Quantize using existing FP8 kernel
     tensor_fp8, scales = scaled_fp8_quant(
         tensor,
-        scale=None,  # Dynamic scaling (compute scale from tensor)
+        scale=None,
         use_per_token_if_dynamic=use_per_token,
     )
 
     # Reshape back if needed
-    if len(original_shape) != 2:
+    if tensor.ndim != len(original_shape):
         tensor_fp8 = tensor_fp8.reshape(*original_shape)
 
-    return tensor_fp8, scales
+    return QuantizedTensor(data=tensor_fp8, scales=scales)
 
 
 def dequantize_fp8_from_comm(
-    tensor_fp8: torch.Tensor,
-    scales: torch.Tensor,
+    quantized: Union[QuantizedTensor, torch.Tensor],
+    scales: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """
-    Dequantize an FP8 tensor back to higher precision after communication.
-
-    This function converts an FP8 tensor back to BF16/FP32 using the scale factors
-    computed during quantization. Uses PyTorch broadcasting to handle both per-tensor
-    and per-token scaling uniformly.
+    Dequantize an FP8 tensor back to higher precision.
 
     Args:
-        tensor_fp8: Quantized FP8 tensor
-        scales: Scale factors from quantization
-                Shape: [1] for per-tensor, [M, 1] for per-token
-        output_dtype: Desired output dtype (default: bfloat16)
+        quantized: QuantizedTensor or raw FP8 tensor.
+        scales: Required if quantized is a raw tensor.
+        output_dtype: Output dtype (default: bfloat16).
 
     Returns:
-        Dequantized tensor in the specified dtype
-
-    Example:
-        >>> # After communication
-        >>> tensor_restored = dequantize_fp8_from_comm(tensor_fp8, scales)
-        >>> error = (tensor - tensor_restored).abs().max()
-        >>> print(f"Max reconstruction error: {error:.6f}")
-        Max reconstruction error: 0.000234
+        Dequantized tensor.
     """
-    # Convert FP8 to the target dtype
+    if isinstance(quantized, QuantizedTensor):
+        tensor_fp8 = quantized.data
+        scales = quantized.scales
+    else:
+        tensor_fp8 = quantized
+
     tensor_dequant = tensor_fp8.to(output_dtype)
 
-    # Reshape to 2D for scaling (if needed)
+    # Reshape to 2D for scaling
     original_shape = tensor_dequant.shape
     if tensor_dequant.ndim != 2:
         tensor_dequant = tensor_dequant.reshape(-1, tensor_dequant.shape[-1])
 
-    # Apply scaling via broadcasting
-    # Works for both per-tensor [1] and per-token [M, 1] scales
     tensor_dequant = tensor_dequant * scales
 
-    # Reshape back to original shape
-    if len(original_shape) != 2:
+    # Reshape back
+    if tensor_dequant.ndim != len(original_shape):
         tensor_dequant = tensor_dequant.reshape(*original_shape)
 
     return tensor_dequant
+
+
+def quantized_all_gather(
+    tensor: torch.Tensor,
+    world_size: int,
+    group: Optional[dist.ProcessGroup] = None,
+    use_per_token: bool = False,
+) -> torch.Tensor:
+    """
+    AllGather with FP8 quantization (50% bandwidth savings).
+
+    This is the ideal use case for FP8 communication - no arithmetic needed.
+
+    Args:
+        tensor: Input tensor to gather.
+        world_size: Number of ranks.
+        group: Process group (default: world group).
+        use_per_token: Use per-row quantization.
+
+    Returns:
+        Gathered tensor. Shape: [tensor.shape[0] * world_size, ...].
+    """
+    original_dtype = tensor.dtype
+
+    quantized = quantize_fp8_for_comm(tensor, use_per_token=use_per_token)
+
+    gathered_fp8_list = [torch.empty_like(quantized.data) for _ in range(world_size)]
+    gathered_scales_list = [torch.empty_like(quantized.scales) for _ in range(world_size)]
+
+    dist.all_gather(gathered_fp8_list, quantized.data, group=group)
+    dist.all_gather(gathered_scales_list, quantized.scales, group=group)
+
+    dequantized_list = [
+        dequantize_fp8_from_comm(fp8, sc, output_dtype=original_dtype)
+        for fp8, sc in zip(gathered_fp8_list, gathered_scales_list)
+    ]
+
+    return torch.cat(dequantized_list, dim=0)
 
 
 def quantized_all_reduce(
@@ -138,91 +155,114 @@ def quantized_all_reduce(
     use_per_token: bool = False,
 ) -> torch.Tensor:
     """
-    Perform AllReduce with FP8 quantization to reduce bandwidth.
+    AllReduce with FP8 quantization (bandwidth savings via AllGather + local sum).
 
-    This function quantizes the input tensor to FP8, performs AllReduce on the
-    quantized data (50% less bandwidth), then dequantizes back to the original dtype.
-
-    The AllReduce operation sums tensors across all ranks in the process group.
-    With quantization:
-    - Each rank quantizes its tensor independently
-    - AllReduce sums the FP8 tensors (bandwidth reduced by 50%)
-    - AllReduce averages the scale factors
-    - Each rank dequantizes using the averaged scale
+    Direct FP8 SUM would overflow and have incorrect math (different scales per rank).
+    Instead: AllGather FP8 tensors, dequantize locally, sum locally.
 
     Args:
-        tensor: Input tensor to reduce. Expected to be BF16 or FP32.
-        group: Process group for communication. If None, uses default group.
-        use_per_token: If True, use per-token quantization for better accuracy.
-                      If False, use per-tensor quantization (default).
+        tensor: Input tensor to reduce.
+        group: Process group (default: world group).
+        use_per_token: Use per-row quantization.
 
     Returns:
-        Reduced tensor in original dtype (sum across all ranks)
-
-    Example:
-        >>> # On GPU 0: tensor = [1.0, 2.0, 3.0]
-        >>> # On GPU 1: tensor = [4.0, 5.0, 6.0]
-        >>> from sglang.srt.distributed import get_tp_group
-        >>> result = quantized_all_reduce(tensor, group=get_tp_group())
-        >>> # Result on both GPUs: [5.0, 7.0, 9.0]
-        >>> # But used 50% less bandwidth than regular AllReduce!
+        Reduced tensor (sum across all ranks).
 
     Note:
-        This introduces small quantization errors but provides significant
-        bandwidth savings. The error is typically <0.5% for FP8.
+        Uses world_size copies of tensor temporarily (memory overhead).
     """
-    # Save original dtype for output
     original_dtype = tensor.dtype
+    world_size = dist.get_world_size(group) if group else dist.get_world_size()
 
-    # Step 1: Quantize to FP8
-    tensor_fp8, scales = quantize_fp8_for_comm(tensor, use_per_token=use_per_token)
+    quantized = quantize_fp8_for_comm(tensor, use_per_token=use_per_token)
 
-    # Step 2: AllReduce the quantized tensor (sum operation)
-    # This is where we save bandwidth - sending FP8 instead of BF16!
-    dist.all_reduce(tensor_fp8, op=dist.ReduceOp.SUM, group=group)
+    gathered_fp8_list = [torch.empty_like(quantized.data) for _ in range(world_size)]
+    gathered_scales_list = [torch.empty_like(quantized.scales) for _ in range(world_size)]
 
-    # Step 3: AllReduce the scales (average them across ranks)
-    # We average scales because each rank computed scales independently
-    # The sum of quantized values should use the average scale for dequantization
-    dist.all_reduce(scales, op=dist.ReduceOp.AVG, group=group)
+    dist.all_gather(gathered_fp8_list, quantized.data, group=group)
+    dist.all_gather(gathered_scales_list, quantized.scales, group=group)
 
-    # Step 4: Dequantize back to original dtype
-    result = dequantize_fp8_from_comm(tensor_fp8, scales, output_dtype=original_dtype)
+    # Dequantize and sum locally
+    result = dequantize_fp8_from_comm(
+        gathered_fp8_list[0], gathered_scales_list[0], output_dtype=original_dtype
+    )
+    for fp8, sc in zip(gathered_fp8_list[1:], gathered_scales_list[1:]):
+        result = result + dequantize_fp8_from_comm(fp8, sc, output_dtype=original_dtype)
 
     return result
 
 
-def should_use_comm_quant(
-    tensor_size_bytes: int,
-    min_size_threshold: int = 1024 * 1024,  # 1 MB default
-) -> bool:
+def quantized_reduce_scatter(
+    tensor: torch.Tensor,
+    world_size: int,
+    group: Optional[dist.ProcessGroup] = None,
+    use_per_token: bool = False,
+) -> torch.Tensor:
     """
-    Determine if communication quantization should be used based on tensor size.
+    ReduceScatter with FP8 quantization.
 
-    For very small tensors, the overhead of quantization/dequantization may
-    outweigh the bandwidth savings. This function provides a simple heuristic.
+    Implementation: AllGather + local sum + slice (not a true reduce_scatter,
+    but ensures correct math with FP8).
 
     Args:
-        tensor_size_bytes: Size of the tensor in bytes
-        min_size_threshold: Minimum size in bytes to enable quantization
+        tensor: Input tensor. First dim must be divisible by world_size.
+        world_size: Number of ranks.
+        group: Process group (default: world group).
+        use_per_token: Use per-row quantization.
 
     Returns:
-        True if quantization should be used, False otherwise
-
-    Example:
-        >>> tensor = torch.randn(32, 2048, 8192, dtype=torch.bfloat16)
-        >>> if should_use_comm_quant(tensor.nbytes):
-        >>>     tensor_fp8, scales = quantize_fp8_for_comm(tensor)
-        >>>     # ... communicate tensor_fp8 ...
-        >>>     tensor = dequantize_fp8_from_comm(tensor_fp8, scales)
+        Reduced and scattered tensor. Shape: [tensor.shape[0] // world_size, ...].
     """
-    return tensor_size_bytes >= min_size_threshold
+    rank = dist.get_rank(group) if group else dist.get_rank()
+
+    reduced = quantized_all_reduce(tensor, group=group, use_per_token=use_per_token)
+
+    chunk_size = tensor.shape[0] // world_size
+    start_idx = rank * chunk_size
+    end_idx = start_idx + chunk_size
+
+    return reduced[start_idx:end_idx].contiguous()
 
 
-# Expose key functions
+def should_use_comm_quant(
+    tensor: Union[torch.Tensor, int],
+    min_size_threshold: int = 1024 * 1024,  # 1 MB
+) -> bool:
+    """
+    Heuristic: use quantized communication for tensors >= threshold.
+
+    For small tensors, quantization overhead may exceed bandwidth savings.
+    """
+    size_bytes = tensor.nbytes if isinstance(tensor, torch.Tensor) else tensor
+    return size_bytes >= min_size_threshold
+
+
+def get_quantization_error_bound(
+    tensor: torch.Tensor,
+    use_per_token: bool = False,
+) -> float:
+    """
+    Measure max relative error from quantize-dequantize round trip.
+
+    Useful for debugging/testing. Has computational cost - use sparingly.
+    """
+    quantized = quantize_fp8_for_comm(tensor, use_per_token=use_per_token)
+    reconstructed = dequantize_fp8_from_comm(quantized, output_dtype=tensor.dtype)
+
+    abs_error = (tensor - reconstructed).abs()
+    abs_values = tensor.abs().clamp(min=1e-10)
+    relative_error = abs_error / abs_values
+
+    return relative_error.max().item()
+
+
 __all__ = [
+    "QuantizedTensor",
     "quantize_fp8_for_comm",
     "dequantize_fp8_from_comm",
+    "quantized_all_gather",
     "quantized_all_reduce",
+    "quantized_reduce_scatter",
     "should_use_comm_quant",
+    "get_quantization_error_bound",
 ]
